@@ -160,15 +160,22 @@ func toolCallEvents(req map[string]any) []domain.Event {
 }
 
 // requestEvents flattens one request into a linear user -> tool calls ->
-// assistant event sequence. It does not insert turn-complete markers.
+// assistant event sequence. It does not insert turn-complete markers. Every
+// event is stamped with the request timestamp (a millisecond epoch carried by
+// both the .json and reassembled .jsonl request objects); VS Code records one
+// timestamp per request rather than per message.
 func requestEvents(req map[string]any) []domain.Event {
+	ts := msToTime(req["timestamp"])
 	var out []domain.Event
 	if ut := requestUserText(req); ut != "" {
-		out = append(out, domain.Event{Kind: domain.EventUser, Text: ut, RawType: "message"})
+		out = append(out, domain.Event{Kind: domain.EventUser, Text: ut, Timestamp: ts, RawType: "message"})
 	}
-	out = append(out, toolCallEvents(req)...)
+	for _, e := range toolCallEvents(req) {
+		e.Timestamp = ts
+		out = append(out, e)
+	}
 	if rt := responseText(req); rt != "" {
-		out = append(out, domain.Event{Kind: domain.EventAssistant, Text: rt, RawType: "message"})
+		out = append(out, domain.Event{Kind: domain.EventAssistant, Text: rt, Timestamp: ts, RawType: "message"})
 	}
 	return out
 }

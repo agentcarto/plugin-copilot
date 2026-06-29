@@ -324,3 +324,46 @@ func TestScanJetBrainsCopilotBackfillsUnknownCWDFromNearbySession(t *testing.T) 
 		t.Fatalf("cwd=%q want %q", byID["unknown"].CWD, repo)
 	}
 }
+
+// TestVSCopilotEventTimestamps guards that VS Code conversation events carry the
+// request timestamp, so the UI can show a date for each turn. Both the flat
+// .json layout and the reassembled .jsonl layout are covered.
+func TestVSCopilotEventTimestamps(t *testing.T) {
+	want := msToTime(float64(1710000001000))
+
+	flat := filepath.Join(t.TempDir(), "s1.json")
+	flatData := `{
+  "creationDate": 1710000000000,
+  "requests": [
+    {
+      "timestamp": 1710000001000,
+      "message": {"text": "explain"},
+      "response": "answer",
+      "result": {"metadata": {"toolCallRounds": [{"toolCalls": [{"name": "read_file", "arguments": {}}]}]}}
+    }
+  ]
+}`
+	if err := os.WriteFile(flat, []byte(flatData), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	stream := filepath.Join(t.TempDir(), "s1.jsonl")
+	streamData := `{"kind":0,"v":{"version":3,"creationDate":1710000000000,"sessionId":"s1","requests":[]}}
+{"kind":2,"k":["requests"],"v":[{"requestId":"r1","timestamp":1710000001000,"modelId":"copilot/auto","message":{"text":"hello"},"response":[{"value":"ok"}]}]}
+`
+	if err := os.WriteFile(stream, []byte(streamData), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{flat, stream} {
+		ev, _ := parseVSCodeSession(path)
+		if len(ev) == 0 {
+			t.Fatalf("%s: no events", path)
+		}
+		for _, e := range ev {
+			if !e.Timestamp.Equal(want) {
+				t.Errorf("%s: event %q timestamp=%v want %v", filepath.Ext(path), e.Kind, e.Timestamp, want)
+			}
+		}
+	}
+}
