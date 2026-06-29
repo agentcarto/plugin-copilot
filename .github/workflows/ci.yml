@@ -1,0 +1,31 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # The plugin replaces github.com/agentcarto/core => ../agentcarto-core,
+      # so check core out as a sibling.
+      - uses: actions/checkout@v4
+        with:
+          path: plugin-copilot
+      - uses: actions/checkout@v4
+        with: { repository: agentcarto/core, path: agentcarto-core }
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: plugin-copilot/go.mod
+      - name: Build & test
+        working-directory: plugin-copilot
+        run: |
+          go build ./...
+          go test ./...
+      - name: Race test
+        if: runner.os == 'Linux'
+        working-directory: plugin-copilot
+        run: go test -race ./...
