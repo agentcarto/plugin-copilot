@@ -75,7 +75,11 @@ func NormalizeCWD(s string) string {
 			}
 			return drive + ":" + rest
 		}
-		return filepath.FromSlash(path)
+		// A non-drive file path (e.g. a POSIX "/home/u/x") is a logical identifier
+		// that must normalize identically on every OS — sessions are browsed
+		// cross-platform — so keep its forward slashes rather than rewriting them
+		// to the host's separator with filepath.FromSlash.
+		return path
 	}
 	if u.Scheme == "vscode-remote" {
 		auth, _ := url.PathUnescape(u.Host)
