@@ -1,0 +1,56 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # The plugin replaces github.com/agentcarto/core => ../agentcarto-core,
+      # so check core out as a sibling. No other plugin repos are needed.
+      - uses: actions/checkout@v4
+        with:
+          path: plugin-copilot
+      - uses: actions/checkout@v4
+        with: { repository: agentcarto/core, path: agentcarto-core }
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: plugin-copilot/go.mod
+
+      - name: Build all targets
+        run: |
+          set -eu
+          root="$PWD"
+          mkdir -p dist
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            export GOOS="${t%/*}" GOARCH="${t#*/}" CGO_ENABLED=0
+            ext=""; [ "$GOOS" = windows ] && ext=".exe"
+            name="agentcarto-plugin-copilot_${GOOS}_${GOARCH}"
+            out="$root/dist/$name"
+            mkdir -p "$out"
+            # Copilot ships two executables (VS Code / JetBrains) in one archive.
+            ( cd "$root/plugin-copilot" && go build -trimpath -ldflags="-s -w" \
+                -o "$out/agentcarto-plugin-copilot-vc$ext" ./cmd/agentcarto-plugin-copilot-vc )
+            ( cd "$root/plugin-copilot" && go build -trimpath -ldflags="-s -w" \
+                -o "$out/agentcarto-plugin-copilot-jb$ext" ./cmd/agentcarto-plugin-copilot-jb )
+            ( cd "$root/dist"
+              if [ "$GOOS" = windows ]; then zip -qr "$name.zip" "$name"; else tar -czf "$name.tar.gz" "$name"; fi )
+            echo "packaged $name"
+          done
+          ls -lh dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release create "$tag" dist/*.tar.gz dist/*.zip \
+            -R "${{ github.repository }}" --title "$tag" --generate-notes \
+            || gh release upload "$tag" dist/*.tar.gz dist/*.zip -R "${{ github.repository }}" --clobber
