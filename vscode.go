@@ -29,7 +29,9 @@ type VSCodeOptions struct {
 type VSCodeFactory struct{}
 
 func (VSCodeFactory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "6", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	// ParserVersion=7: user events now carry the normalized Prompt field
+	// (agent-specific pseudo-prompt vocabulary moved out of core).
+	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "7", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (VSCodeFactory) New(id string, n *yaml.Node) (any, error) {
@@ -183,7 +185,7 @@ func requestEvents(req map[string]any) []domain.Event {
 	ts := msToTime(req["timestamp"])
 	var out []domain.Event
 	if ut := requestUserText(req); ut != "" {
-		out = append(out, domain.Event{Kind: domain.EventUser, Text: ut, Timestamp: ts, RawType: "message"})
+		out = append(out, userEvent(ut, ts, "message"))
 	}
 	return append(out, responseEvents(req, ts)...)
 }

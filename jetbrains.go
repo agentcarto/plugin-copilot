@@ -26,7 +26,9 @@ type JetBrainsOptions struct {
 type JetBrainsFactory struct{}
 
 func (JetBrainsFactory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "2", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	// ParserVersion=3: user events now carry the normalized Prompt field
+	// (agent-specific pseudo-prompt vocabulary moved out of core).
+	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "3", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (JetBrainsFactory) New(id string, n *yaml.Node) (any, error) {
@@ -230,7 +232,7 @@ func jetBrainsRecordEvents(typ string, data map[string]any, ts time.Time) []doma
 	switch typ {
 	case "user.message":
 		if text := strings.TrimSpace(common.String(data["content"])); text != "" {
-			return []domain.Event{{Kind: domain.EventUser, Text: text, Timestamp: ts, RawType: "user.message"}}
+			return []domain.Event{userEvent(text, ts, "user.message")}
 		}
 	case "assistant.message":
 		var out []domain.Event

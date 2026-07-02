@@ -17,6 +17,25 @@ import (
 // factories. The editor-specific scanning and parsing live in vscode.go and
 // jetbrains.go respectively.
 
+// promptText returns the cleaned, whitespace-folded genuine prompt in text, or
+// "" when the message is an editor-injected <context-...> attachment or a
+// short single-line slash command (/fix, /explain) rather than real user input.
+func promptText(text string) string {
+	t := strings.TrimSpace(text)
+	if t == "" || strings.HasPrefix(strings.ToLower(t), "<context-") {
+		return ""
+	}
+	if strings.HasPrefix(t, "/") && !strings.Contains(t, "\n") && len([]rune(t)) <= 40 {
+		return ""
+	}
+	return strings.Join(strings.Fields(t), " ")
+}
+
+// userEvent builds a user event annotated with the normalized Prompt field.
+func userEvent(text string, ts time.Time, rawType string) domain.Event {
+	return domain.Event{Kind: domain.EventUser, Text: text, Timestamp: ts, RawType: rawType, Prompt: promptText(text)}
+}
+
 // scanEntry runs the standard scan-cache lifecycle for a single target keyed by
 // `key` (a file path for VS Code, a session directory for JetBrains): reuse a
 // warm result, skip a dead entry, otherwise build a fresh session. It returns
