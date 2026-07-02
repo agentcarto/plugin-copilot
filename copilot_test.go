@@ -30,7 +30,7 @@ func TestParseJetBrainsCopilot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "partition-1.jsonl"), []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
-	ev, started := parseJetBrainsCopilotWithStart(dir)
+	ev, started := parseJetBrainsCopilotWithStart(context.Background(), dir)
 	if len(ev) != 3 {
 		t.Fatalf("events=%d %#v", len(ev), ev)
 	}

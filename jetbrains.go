@@ -26,7 +26,7 @@ type JetBrainsOptions struct {
 type JetBrainsFactory struct{}
 
 func (JetBrainsFactory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "1", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "2", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (JetBrainsFactory) New(id string, n *yaml.Node) (any, error) {
@@ -87,7 +87,7 @@ func (p *jetbrainsPlugin) scanDir(ctx context.Context, root string, cache *scan.
 			continue
 		}
 		if s, ok := scanEntry(cache, dir, func() (domain.Session, bool) {
-			return p.buildSession(dir, d.Name())
+			return p.buildSession(ctx, dir, d.Name())
 		}); ok {
 			out = append(out, s)
 		}
@@ -100,8 +100,8 @@ func (p *jetbrainsPlugin) scanDir(ctx context.Context, root string, cache *scan.
 
 // buildSession parses a single JetBrains session directory into a Session,
 // reporting false when it contains no usable events.
-func (p *jetbrainsPlugin) buildSession(dir, id string) (domain.Session, bool) {
-	ev, started, cwd := parseJetBrainsCopilotWithMeta(dir)
+func (p *jetbrainsPlugin) buildSession(ctx context.Context, dir, id string) (domain.Session, bool) {
+	ev, started, cwd := parseJetBrainsCopilotWithMeta(ctx, dir)
 	if len(ev) == 0 {
 		return domain.Session{}, false
 	}
@@ -125,8 +125,8 @@ func (p *jetbrainsPlugin) buildSession(dir, id string) (domain.Session, bool) {
 	}, true
 }
 
-func (p *jetbrainsPlugin) LoadConversation(_ context.Context, r domain.SessionRef) (*domain.Conversation, error) {
-	ev := parseJetBrainsCopilot(r.Source)
+func (p *jetbrainsPlugin) LoadConversation(ctx context.Context, r domain.SessionRef) (*domain.Conversation, error) {
+	ev := parseJetBrainsCopilot(ctx, r.Source)
 	c := common.Linear(ev)
 	return &c, nil
 }
@@ -183,29 +183,29 @@ func absDuration(d time.Duration) time.Duration {
 }
 
 // parseJetBrainsCopilot returns just the events of a session directory.
-func parseJetBrainsCopilot(dir string) []domain.Event {
-	ev, _ := parseJetBrainsCopilotWithStart(dir)
+func parseJetBrainsCopilot(ctx context.Context, dir string) []domain.Event {
+	ev, _ := parseJetBrainsCopilotWithStart(ctx, dir)
 	return ev
 }
 
 // parseJetBrainsCopilotWithStart returns the events and start time of a session
 // directory.
-func parseJetBrainsCopilotWithStart(dir string) ([]domain.Event, time.Time) {
-	ev, start, _ := parseJetBrainsCopilotWithMeta(dir)
+func parseJetBrainsCopilotWithStart(ctx context.Context, dir string) ([]domain.Event, time.Time) {
+	ev, start, _ := parseJetBrainsCopilotWithMeta(ctx, dir)
 	return ev, start
 }
 
 // parseJetBrainsCopilotWithMeta parses every partition-*.jsonl file in a session
 // directory (in sorted order) into a flat event list, and additionally reports
 // the session start time and the inferred working directory.
-func parseJetBrainsCopilotWithMeta(dir string) ([]domain.Event, time.Time, string) {
+func parseJetBrainsCopilotWithMeta(ctx context.Context, dir string) ([]domain.Event, time.Time, string) {
 	files, _ := filepath.Glob(filepath.Join(dir, "partition-*.jsonl"))
 	sort.Strings(files)
 	var events []domain.Event
 	var start time.Time
 	var paths []string
 	for _, f := range files {
-		_ = common.JSONLines(context.Background(), f, func(_ int, o map[string]any) error {
+		_ = common.JSONLines(ctx, f, func(_ int, o map[string]any) error {
 			ts := common.Time(common.String(o["timestamp"]))
 			if start.IsZero() && !ts.IsZero() {
 				start = ts

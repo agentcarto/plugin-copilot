@@ -29,7 +29,7 @@ type VSCodeOptions struct {
 type VSCodeFactory struct{}
 
 func (VSCodeFactory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "4", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "5", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (VSCodeFactory) New(id string, n *yaml.Node) (any, error) {
