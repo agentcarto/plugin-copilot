@@ -29,7 +29,7 @@ type VSCodeOptions struct {
 type VSCodeFactory struct{}
 
 func (VSCodeFactory) Descriptor() plugin.Descriptor {
-	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "5", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "6", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (VSCodeFactory) New(id string, n *yaml.Node) (any, error) {
@@ -115,69 +115,267 @@ func requestUserText(req map[string]any) string {
 	return stripIDE(text)
 }
 
-func responseText(req map[string]any) string {
-	switch x := req["response"].(type) {
-	case []any:
-		var parts []string
-		for _, p := range x {
-			if v := common.String(common.Map(p)["value"]); strings.TrimSpace(v) != "" {
-				parts = append(parts, v)
-			}
-		}
-		return strings.TrimSpace(strings.Join(parts, "\n"))
-	case string:
-		return strings.TrimSpace(x)
-	}
-	return ""
-}
+// toolCallInfo is one entry of result.metadata.toolCallRounds: the function
+// name and its JSON arguments.
+type toolCallInfo struct{ name, args string }
 
-// toolCallEvents extracts the tool-call events of a single request. They come
-// from two shapes: .json files carry result.metadata.toolCallRounds, while
-// .jsonl files inline kind="tool" entries in response[].
-func toolCallEvents(req map[string]any) []domain.Event {
-	var out []domain.Event
-	rounds := common.Slice(common.Map(common.Map(req["result"])["metadata"])["toolCallRounds"])
-	for _, rnd := range rounds {
+// roundsByID indexes result.metadata.toolCallRounds by tool-call id, keeping
+// the call order for the calls that never surface as a response part.
+func roundsByID(req map[string]any) (map[string]toolCallInfo, []string) {
+	out := map[string]toolCallInfo{}
+	var order []string
+	md := common.Map(common.Map(req["result"])["metadata"])
+	for _, rnd := range common.Slice(md["toolCallRounds"]) {
 		for _, tc := range common.Slice(common.Map(rnd)["toolCalls"]) {
 			m := common.Map(tc)
-			name := common.String(m["name"])
-			if name == "" {
-				name = common.String(m["id"])
-			}
-			if name == "" {
-				name = "tool"
-			}
-			out = append(out, domain.Event{Kind: domain.EventToolCall, Text: common.Text(m["arguments"]), ToolName: name, RawType: "tool_call"})
+			id := common.String(m["id"])
+			out[id] = toolCallInfo{name: common.String(m["name"]), args: common.Text(m["arguments"])}
+			order = append(order, id)
 		}
 	}
-	for _, p := range common.Slice(req["response"]) {
-		m := common.Map(p)
-		if kind := common.String(m["kind"]); strings.Contains(strings.ToLower(kind), "tool") {
-			out = append(out, domain.Event{Kind: domain.EventToolCall, Text: common.String(m["value"]), ToolName: common.String(m["name"]), RawType: "tool_call"})
+	return out, order
+}
+
+// resultsByID extracts result.metadata.toolCallResults as plain text per call id.
+func resultsByID(req map[string]any) map[string]string {
+	out := map[string]string{}
+	md := common.Map(common.Map(req["result"])["metadata"])
+	for id, v := range common.Map(md["toolCallResults"]) {
+		if s := strings.TrimSpace(renderTreeText(v)); s != "" {
+			out[id] = s
 		}
 	}
 	return out
 }
 
-// requestEvents flattens one request into a linear user -> tool calls ->
-// assistant event sequence. It does not insert turn-complete markers. Every
-// event is stamped with the request timestamp (a millisecond epoch carried by
-// both the .json and reassembled .jsonl request objects); VS Code records one
-// timestamp per request rather than per message.
+// renderTreeText flattens VS Code's rendered-result tree (content[].value.node.
+// children[].text, nested) into plain text. Only the ordered container fields
+// are walked — a full map walk would visit keys in random order.
+func renderTreeText(v any) string {
+	var b strings.Builder
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if t, ok := x["text"].(string); ok {
+				if lb, _ := x["lineBreakBefore"].(bool); lb && b.Len() > 0 {
+					b.WriteByte('\n')
+				}
+				b.WriteString(t)
+			}
+			for _, k := range []string{"content", "value", "node", "children"} {
+				walk(x[k])
+			}
+		case []any:
+			for _, it := range x {
+				walk(it)
+			}
+		}
+	}
+	walk(v)
+	return b.String()
+}
+
+// requestEvents flattens one request into a user event followed by the response
+// parts in their recorded order. Every event is stamped with the request
+// timestamp (VS Code records one timestamp per request rather than per message).
 func requestEvents(req map[string]any) []domain.Event {
 	ts := msToTime(req["timestamp"])
 	var out []domain.Event
 	if ut := requestUserText(req); ut != "" {
 		out = append(out, domain.Event{Kind: domain.EventUser, Text: ut, Timestamp: ts, RawType: "message"})
 	}
-	for _, e := range toolCallEvents(req) {
-		e.Timestamp = ts
-		out = append(out, e)
+	return append(out, responseEvents(req, ts)...)
+}
+
+// responseEvents walks the response parts in order, buffering markdown
+// fragments (which carry their own whitespace, so they are concatenated as-is)
+// and flushing the buffer as one assistant event whenever a non-markdown part
+// interrupts the flow. Tool calls take their arguments from toolCallRounds and
+// their result from toolCallResults. The serialized invocation parts use their
+// own UUIDs, unrelated to the rounds/results ids, but the Nth invocation part
+// is the Nth rounds call (verified 275/275 on real data), so the join is
+// positional; rounds entries beyond the surfaced parts are appended at the end
+// so no call is lost.
+func responseEvents(req map[string]any, ts time.Time) []domain.Event {
+	calls, order := roundsByID(req)
+	results := resultsByID(req)
+	next := 0
+	var out []domain.Event
+	var md strings.Builder
+	flush := func() {
+		s := strings.TrimSpace(md.String())
+		md.Reset()
+		// A lone code fence is the leftover of a block whose body was recorded
+		// as a textEditGroup part rather than markdown; drop the empty shell.
+		if s == "" || (strings.HasPrefix(s, "```") && !strings.Contains(s, "\n")) {
+			return
+		}
+		out = append(out, domain.Event{Kind: domain.EventAssistant, Text: s, Timestamp: ts, RawType: "message"})
 	}
-	if rt := responseText(req); rt != "" {
-		out = append(out, domain.Event{Kind: domain.EventAssistant, Text: rt, Timestamp: ts, RawType: "message"})
+	emitCall := func(id, name, text string) {
+		if name == "" {
+			name = "tool"
+		}
+		out = append(out, domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: name, RawType: "tool_call"})
+		if r := results[id]; r != "" {
+			out = append(out, domain.Event{Kind: domain.EventToolResult, Text: r, Timestamp: ts, RawType: "tool_result"})
+		}
+	}
+	parts, isList := req["response"].([]any)
+	if !isList {
+		// Old flat layout: the response is a single markdown string.
+		md.WriteString(common.String(req["response"]))
+	}
+	for _, p := range parts {
+		m := common.Map(p)
+		if m == nil {
+			continue
+		}
+		switch common.String(m["kind"]) {
+		case "":
+			md.WriteString(common.String(m["value"]))
+		case "inlineReference":
+			// A file reference splitting the markdown mid-sentence; put its
+			// name back into the flow.
+			md.WriteString(inlineRefName(m))
+		case "thinking":
+			flush()
+			// Plaintext reasoning only; an empty value with an opaque id is the
+			// encrypted form.
+			if t := strings.TrimSpace(common.Text(m["value"])); t != "" {
+				out = append(out, domain.Event{Kind: domain.EventReasoning, Text: t, Timestamp: ts, RawType: "thinking"})
+			}
+		case "toolInvocationSerialized":
+			flush()
+			id := ""
+			if next < len(order) {
+				id = order[next]
+				next++
+			}
+			name := common.String(m["toolId"])
+			if name == "" {
+				name = calls[id].name
+			}
+			text := calls[id].args
+			if text == "" {
+				// Terminal runs keep their command in toolSpecificData rather
+				// than the (empty) invocation message.
+				text = common.String(common.Map(common.Map(m["toolSpecificData"])["commandLine"])["original"])
+			}
+			if text == "" {
+				text = markdownString(m["invocationMessage"])
+			}
+			emitCall(id, name, text)
+		case "textEditGroup":
+			flush()
+			if e := textEditEvent(m, ts); e != nil {
+				out = append(out, *e)
+			}
+		case "questionCarousel":
+			flush()
+			if t := questionText(m); t != "" {
+				out = append(out, domain.Event{Kind: domain.EventAssistant, Text: t, Timestamp: ts, RawType: "question"})
+			}
+		case "subagent":
+			flush()
+			text := strings.TrimSpace(strings.TrimSpace(common.String(m["description"])) + "\n\n" + common.String(m["prompt"]))
+			out = append(out, domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: "subagent", RawType: "subagent"})
+		case "confirmation", "warning":
+			flush()
+			body := markdownString(m["message"])
+			if body == "" {
+				body = markdownString(m["content"])
+			}
+			if t := strings.TrimSpace(strings.TrimSpace(common.String(m["title"])) + "\n" + body); t != "" {
+				out = append(out, domain.Event{Kind: domain.EventSystem, Text: t, Timestamp: ts, RawType: common.String(m["kind"])})
+			}
+		}
+	}
+	flush()
+	for _, id := range order[next:] {
+		emitCall(id, calls[id].name, calls[id].args)
 	}
 	return out
+}
+
+// markdownString unwraps VS Code's markdown-string values, which appear both as
+// plain strings and as {"value": ...} objects.
+func markdownString(v any) string {
+	if s := common.String(v); s != "" {
+		return s
+	}
+	return common.String(common.Map(v)["value"])
+}
+
+// inlineRefName returns the display name of an inlineReference part, falling
+// back to the referenced file's basename ("inlineReference" holds either the
+// uri object directly or a wrapper with a "uri" field).
+func inlineRefName(m map[string]any) string {
+	if n := common.String(m["name"]); n != "" {
+		return n
+	}
+	ref := common.Map(m["inlineReference"])
+	uri := common.Map(ref["uri"])
+	if uri == nil {
+		uri = ref
+	}
+	p := common.String(uri["path"])
+	if p == "" {
+		p = common.String(uri["fsPath"])
+	}
+	return filepath.Base(p)
+}
+
+// textEditEvent renders a textEditGroup (an applied edit) as a file-change
+// event in apply_patch form. The log only records the inserted text — the
+// replaced content is gone — so the hunk carries "+" lines only.
+func textEditEvent(m map[string]any, ts time.Time) *domain.Event {
+	uri := common.Map(m["uri"])
+	path := common.String(uri["fsPath"])
+	if path == "" {
+		path = common.String(uri["path"])
+	}
+	if path == "" {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("*** Begin Patch\n*** Update File: " + path)
+	for _, group := range common.Slice(m["edits"]) {
+		for _, ed := range common.Slice(group) {
+			text := common.String(common.Map(ed)["text"])
+			if text == "" {
+				continue
+			}
+			for _, ln := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+				b.WriteString("\n+" + ln)
+			}
+		}
+	}
+	b.WriteString("\n*** End Patch")
+	return &domain.Event{Kind: domain.EventFileChange, Text: b.String(), Timestamp: ts, RawType: "textEditGroup"}
+}
+
+// questionText renders a questionCarousel (the agent asking the user to pick
+// options) as markdown: each question followed by its option labels.
+func questionText(m map[string]any) string {
+	var lines []string
+	for _, q := range common.Slice(m["questions"]) {
+		qm := common.Map(q)
+		t := markdownString(qm["message"])
+		if t == "" {
+			t = common.String(qm["title"])
+		}
+		if t != "" {
+			lines = append(lines, t)
+		}
+		for _, o := range common.Slice(qm["options"]) {
+			if l := common.String(common.Map(o)["label"]); l != "" {
+				lines = append(lines, "- "+l)
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // copilotDefaultTitles holds the placeholder titles VS Code assigns to a chat
@@ -249,79 +447,64 @@ func walkJSON(v any, fn func(map[string]any)) {
 	}
 }
 
-// jsonlBuilder reassembles the streaming .jsonl session format into a single
-// root object equivalent to the flat .json layout. Records are grouped by
-// requestId; duplicate response values are de-duplicated per request.
-type jsonlBuilder struct {
-	root  map[string]any
-	reqs  []any
-	byID  map[string]map[string]any
-	seen  map[string]map[string]bool
-	cur   map[string]any
-	curID string
-}
-
-// consume folds a single decoded map node into the builder state.
-func (jb *jsonlBuilder) consume(o map[string]any) {
-	rid := common.String(o["requestId"])
-	if rid != "" && len(common.Map(o["message"])) > 0 {
-		if jb.byID[rid] == nil {
-			jb.byID[rid] = map[string]any{"message": o["message"], "response": []any{}, "result": o["result"], "timestamp": o["timestamp"]}
-			jb.reqs = append(jb.reqs, jb.byID[rid])
-			jb.seen[rid] = map[string]bool{}
-		}
-		jb.cur = jb.byID[rid]
-		jb.curID = rid
-		return
-	}
-	if jb.cur == nil {
-		return
-	}
-	if val := common.String(o["value"]); val != "" && (o["supportHtml"] != nil || o["baseUri"] != nil) {
-		if !jb.seen[jb.curID][val] {
-			jb.seen[jb.curID][val] = true
-			jb.cur["response"] = append(common.Slice(jb.cur["response"]), map[string]any{"value": val})
-		}
-	} else if name := common.String(o["toolId"]); name != "" {
-		jb.cur["response"] = append(common.Slice(jb.cur["response"]), map[string]any{"kind": "tool", "name": name, "value": common.Text(o["invocationMessage"])})
-	}
-}
-
+// rebuildJSONL replays the streaming .jsonl session format into the final root
+// object. The file is an operation log: kind 0 carries the initial state
+// snapshot, kind 1 sets the value at path "k", and kind 2 appends "v"'s items
+// to the array at path "k". Replaying the ops yields the exact same layout the
+// flat .json files use.
 func rebuildJSONL(b []byte) map[string]any {
-	jb := &jsonlBuilder{
-		root: map[string]any{},
-		byID: map[string]map[string]any{},
-		seen: map[string]map[string]bool{},
-	}
+	root := map[string]any{}
 	for _, line := range strings.Split(string(b), "\n") {
-		var ln map[string]any
+		var ln struct {
+			Kind float64 `json:"kind"`
+			K    []any   `json:"k"`
+			V    any     `json:"v"`
+		}
 		if json.Unmarshal([]byte(line), &ln) != nil {
 			continue
 		}
-		// kind==0 carries the header object; merge its fields into root.
-		if n, ok := ln["kind"].(float64); ok && n == 0 {
-			if m := common.Map(ln["v"]); len(m) > 0 {
-				for k, v := range m {
-					jb.root[k] = v
-				}
+		switch {
+		case ln.Kind == 0:
+			if m := common.Map(ln.V); len(m) > 0 {
+				root = m
+			}
+		case len(ln.K) > 0:
+			if m, ok := applyOp(root, ln.K, ln.V, ln.Kind == 2).(map[string]any); ok {
+				root = m
 			}
 		}
-		// A single-element "k" path names a top-level root key.
-		if k := jsonlRootKey(ln["k"]); k != "" {
-			jb.root[k] = ln["v"]
-		}
-		walkJSON(ln["v"], jb.consume)
 	}
-	jb.root["requests"] = jb.reqs
-	return jb.root
+	return root
 }
 
-func jsonlRootKey(v any) string {
-	ks := common.Slice(v)
-	if len(ks) != 1 {
-		return ""
+// applyOp applies one .jsonl operation to the container c at path: a set
+// (replacing the value) or an append (extending the array with v's items).
+// Missing intermediate containers are created; out-of-range indexes pad with
+// nil. The (possibly re-allocated) container is returned.
+func applyOp(c any, path []any, v any, appendOp bool) any {
+	if len(path) == 0 {
+		if appendOp {
+			return append(common.Slice(c), common.Slice(v)...)
+		}
+		return v
 	}
-	return common.String(ks[0])
+	switch key := path[0].(type) {
+	case string:
+		m, ok := c.(map[string]any)
+		if !ok {
+			m = map[string]any{}
+		}
+		m[key] = applyOp(m[key], path[1:], v, appendOp)
+		return m
+	case float64:
+		s, _ := c.([]any)
+		for len(s) <= int(key) {
+			s = append(s, nil)
+		}
+		s[int(key)] = applyOp(s[int(key)], path[1:], v, appendOp)
+		return s
+	}
+	return c
 }
 
 // workspaceCWD reads workspace.json in a workspaceStorage directory and returns

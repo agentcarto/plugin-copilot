@@ -328,6 +328,109 @@ func TestScanJetBrainsCopilotBackfillsUnknownCWDFromNearbySession(t *testing.T) 
 // TestVSCopilotEventTimestamps guards that VS Code conversation events carry the
 // request timestamp, so the UI can show a date for each turn. Both the flat
 // .json layout and the reassembled .jsonl layout are covered.
+// Response parts must surface in their recorded order: thinking as reasoning,
+// tool invocations with arguments from rounds and results from toolCallResults,
+// inline file references back in the markdown flow, applied edits as file
+// changes, and question carousels as assistant text.
+func TestVSCopilotResponsePartsInOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s1.json")
+	data := `{
+  "creationDate": 1710000000000,
+  "requests": [
+    {
+      "timestamp": 1710000001000,
+      "message": {"text": "split the chapter"},
+      "response": [
+        {"kind": "thinking", "value": "compare both chapters first", "id": "t1"},
+        {"kind": "toolInvocationSerialized", "toolCallId": "c1", "toolId": "copilot_readFile",
+         "invocationMessage": {"value": "reading file", "supportHtml": false}},
+        {"kind": "prepareToolInvocation", "toolName": "copilot_readFile"},
+        {"value": "対象は "},
+        {"kind": "inlineReference", "name": "ReVIEW/09.re", "inlineReference": {"uri": {"path": "/d:/repo/ReVIEW/09.re"}}},
+        {"value": " の章分割だと見ています。\n"},
+        {"kind": "textEditGroup", "uri": {"fsPath": "/repo/a.re"}, "edits": [[{"text": "new line 1\nnew line 2\n"}]]},
+        {"kind": "questionCarousel", "questions": [
+          {"title": "Theme", "message": {"value": "どんな見た目にしますか？"},
+           "options": [{"label": "ミニマル"}, {"label": "リッチ"}]}
+        ]}
+      ],
+      "result": {"metadata": {
+        "toolCallRounds": [{"toolCalls": [
+          {"id": "c1", "name": "read_file", "arguments": "{\"filePath\": \"a.re\"}"},
+          {"id": "c2", "name": "grep", "arguments": "{\"pattern\": \"x\"}"}
+        ]}],
+        "toolCallResults": {"c1": {"content": [{"value": {"node": {"children": [
+          {"text": "File: ", "lineBreakBefore": false},
+          {"text": "a.re", "lineBreakBefore": false},
+          {"text": "1: line one", "lineBreakBefore": true}
+        ]}}}]}}
+      }}
+    }
+  ]
+}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, _ := parseVSCodeSession(path)
+	var got []string
+	for _, e := range ev {
+		got = append(got, string(e.Kind)+":"+e.ToolName+":"+e.Text)
+	}
+	want := []string{
+		"user::split the chapter",
+		"reasoning::compare both chapters first",
+		"tool_call:copilot_readFile:{\"filePath\": \"a.re\"}",
+		"tool_result::File: a.re\n1: line one",
+		"assistant::対象は ReVIEW/09.re の章分割だと見ています。",
+		"file_change::*** Begin Patch\n*** Update File: /repo/a.re\n+new line 1\n+new line 2\n*** End Patch",
+		"assistant::どんな見た目にしますか？\n- ミニマル\n- リッチ",
+		"tool_call:grep:{\"pattern\": \"x\"}",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("events:\n%q\nwant:\n%q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("event %d:\n got %q\nwant %q", i, got[i], want[i])
+		}
+	}
+}
+
+// The .jsonl op log (kind 0 snapshot / kind 1 set / kind 2 append) replays into
+// the same layout as flat .json files, preserving response parts, results, and
+// the request's modelId.
+func TestVSCopilotJSONLOpReplay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s1.jsonl")
+	data := `{"kind":0,"v":{"version":3,"creationDate":1710000000000,"sessionId":"s1","requests":[{"requestId":"r1","timestamp":1710000001000,"modelId":"copilot/gpt","message":{"text":"hello"},"response":[{"kind":"thinking","value":"hm","id":"t1"}]}]}}
+{"kind":2,"k":["requests",0,"response"],"v":[{"value":"done\n"}]}
+{"kind":1,"k":["requests",0,"result"],"v":{"metadata":{"toolCallRounds":[{"toolCalls":[{"id":"c1","name":"bash","arguments":"{}"}]}],"toolCallResults":{"c1":{"content":[{"value":{"node":{"children":[{"text":"ok"}]}}}]}}}}}
+{"kind":2,"k":["requests"],"v":[{"requestId":"r2","timestamp":1710000002000,"message":{"text":"next"},"response":[{"value":"sure"}]}]}
+`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, root := parseVSCodeSession(path)
+	var got []string
+	for _, e := range ev {
+		got = append(got, string(e.Kind)+":"+e.Text)
+	}
+	want := []string{
+		"user:hello", "reasoning:hm", "assistant:done", "tool_call:{}", "tool_result:ok",
+		"user:next", "assistant:sure",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("events:\n%q\nwant:\n%q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("event %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if m := copilotModel(root); m != "copilot/gpt" {
+		t.Fatalf("model=%q, want copilot/gpt (modelId must survive the replay)", m)
+	}
+}
+
 func TestVSCopilotEventTimestamps(t *testing.T) {
 	want := msToTime(float64(1710000001000))
 
