@@ -1,5 +1,11 @@
 name: CI
-on: [push, pull_request]
+# Branch pushes and PRs run this directly; tag pushes run it once, as the
+# release workflow's test gate (workflow_call), instead of racing beside it.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
 permissions:
   contents: read
 jobs:

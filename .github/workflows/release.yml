@@ -10,7 +10,13 @@ on:
 permissions:
   contents: write
 jobs:
+  # Gate: CI must pass on the released ref before anything is built or published.
+  test:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       # The plugin replaces github.com/agentcarto/core => ../agentcarto-core,
