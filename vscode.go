@@ -33,7 +33,9 @@ func (VSCodeFactory) Descriptor() plugin.Descriptor {
 	// (agent-specific pseudo-prompt vocabulary moved out of core).
 	// ParserVersion=8: tool calls carry ToolArg and unknown-CWD sessions are
 	// flagged InferCWD for the host's cross-plugin backfill.
-	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "8", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	// ParserVersion=9: textEditGroup file changes carry structured Changes
+	// (without them the host renders the edit nowhere).
+	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "9", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (VSCodeFactory) New(id string, n *yaml.Node) (any, error) {
@@ -221,7 +223,7 @@ func responseEvents(req map[string]any, ts time.Time) []domain.Event {
 		if name == "" {
 			name = "tool"
 		}
-		out = append(out, domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: name, RawType: "tool_call", ToolArg: toolArg(text)})
+		out = append(out, domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: name, RawType: "tool_call", ToolArg: common.ToolArgFromJSON(text)})
 		if r := results[id]; r != "" {
 			out = append(out, domain.Event{Kind: domain.EventToolResult, Text: r, Timestamp: ts, RawType: "tool_result"})
 		}
@@ -357,7 +359,10 @@ func textEditEvent(m map[string]any, ts time.Time) *domain.Event {
 		}
 	}
 	b.WriteString("\n*** End Patch")
-	return &domain.Event{Kind: domain.EventFileChange, Text: b.String(), Timestamp: ts, RawType: "textEditGroup"}
+	doc := b.String()
+	// Changes drives the host's consolidated file-diff section and edit stats;
+	// without it an EventFileChange renders nowhere.
+	return &domain.Event{Kind: domain.EventFileChange, Text: doc, Timestamp: ts, RawType: "textEditGroup", Changes: common.SplitPatch(doc)}
 }
 
 // questionText renders a questionCarousel (the agent asking the user to pick

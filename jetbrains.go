@@ -256,7 +256,7 @@ func jetBrainsRecordEvents(typ string, data map[string]any, ts time.Time) []doma
 		return out
 	case "tool.execution_start":
 		args := common.Text(data["arguments"])
-		return []domain.Event{{Kind: domain.EventToolCall, Text: args, Timestamp: ts, ToolName: common.String(data["toolName"]), RawType: "tool.execution_start", ToolArg: toolArg(args)}}
+		return []domain.Event{{Kind: domain.EventToolCall, Text: args, Timestamp: ts, ToolName: common.String(data["toolName"]), RawType: "tool.execution_start", ToolArg: common.ToolArgFromJSON(args)}}
 	case "tool.execution_complete":
 		text := common.Text(data["result"])
 		if text == "{}" || strings.TrimSpace(text) == "" {

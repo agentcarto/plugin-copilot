@@ -1,7 +1,6 @@
 package copilot
 
 import (
-	"encoding/json"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,7 +25,7 @@ func promptText(text string) string {
 	if t == "" || strings.HasPrefix(strings.ToLower(t), "<context-") {
 		return ""
 	}
-	if strings.HasPrefix(t, "/") && !strings.Contains(t, "\n") && len([]rune(t)) <= 40 {
+	if common.IsBareSlashCommand(t) {
 		return ""
 	}
 	return strings.Join(strings.Fields(t), " ")
@@ -35,21 +34,6 @@ func promptText(text string) string {
 // userEvent builds a user event annotated with the normalized Prompt field.
 func userEvent(text string, ts time.Time, rawType string) domain.Event {
 	return domain.Event{Kind: domain.EventUser, Text: text, Timestamp: ts, RawType: rawType, Prompt: promptText(text)}
-}
-
-// toolArg extracts the one-line display argument for a tool call from its JSON
-// invocation payload, or "" when the payload has no salient string field.
-func toolArg(text string) string {
-	var m map[string]any
-	if json.Unmarshal([]byte(text), &m) != nil {
-		return ""
-	}
-	for _, k := range []string{"description", "file_path", "notebook_path", "path", "command", "pattern", "query", "url", "prompt"} {
-		if v, _ := m[k].(string); strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
 }
 
 // scanEntry runs the standard scan-cache lifecycle for a single target keyed by
