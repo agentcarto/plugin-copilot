@@ -28,7 +28,9 @@ type JetBrainsFactory struct{}
 func (JetBrainsFactory) Descriptor() plugin.Descriptor {
 	// ParserVersion=3: user events now carry the normalized Prompt field
 	// (agent-specific pseudo-prompt vocabulary moved out of core).
-	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "3", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	// ParserVersion=4: tool calls carry ToolArg and unknown-CWD sessions are
+	// flagged InferCWD for the host's cross-plugin backfill.
+	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "4", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (JetBrainsFactory) New(id string, n *yaml.Node) (any, error) {
@@ -119,6 +121,10 @@ func (p *jetbrainsPlugin) buildSession(ctx context.Context, dir, id string) (dom
 		AgentType: "copilot-jb",
 		SessionID: id,
 		CWD:       cwd,
+		// Copilot logs often carry no workspace path; let the host infer one
+		// from a temporally-near session (a cross-plugin heuristic) unless the
+		// intra-plugin backfill below resolves it first.
+		InferCWD:  cwd == "(unknown)",
 		StartedAt: started,
 		UpdatedAt: updated,
 		Title:     common.Title(ev, "(no title)"),
@@ -166,6 +172,7 @@ func backfillUnknownCWD(sessions []domain.Session, maxGap time.Duration) {
 		}
 		if bestCWD != "" {
 			sessions[i].CWD = bestCWD
+			sessions[i].InferCWD = false
 		}
 	}
 }
@@ -248,7 +255,8 @@ func jetBrainsRecordEvents(typ string, data map[string]any, ts time.Time) []doma
 		}
 		return out
 	case "tool.execution_start":
-		return []domain.Event{{Kind: domain.EventToolCall, Text: common.Text(data["arguments"]), Timestamp: ts, ToolName: common.String(data["toolName"]), RawType: "tool.execution_start"}}
+		args := common.Text(data["arguments"])
+		return []domain.Event{{Kind: domain.EventToolCall, Text: args, Timestamp: ts, ToolName: common.String(data["toolName"]), RawType: "tool.execution_start", ToolArg: toolArg(args)}}
 	case "tool.execution_complete":
 		text := common.Text(data["result"])
 		if text == "{}" || strings.TrimSpace(text) == "" {

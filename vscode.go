@@ -31,7 +31,9 @@ type VSCodeFactory struct{}
 func (VSCodeFactory) Descriptor() plugin.Descriptor {
 	// ParserVersion=7: user events now carry the normalized Prompt field
 	// (agent-specific pseudo-prompt vocabulary moved out of core).
-	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "7", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	// ParserVersion=8: tool calls carry ToolArg and unknown-CWD sessions are
+	// flagged InferCWD for the host's cross-plugin backfill.
+	return plugin.Descriptor{Type: "copilot-vc", DisplayName: "GitHub Copilot Chat (VS Code)", ParserVersion: "8", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (VSCodeFactory) New(id string, n *yaml.Node) (any, error) {
@@ -219,7 +221,7 @@ func responseEvents(req map[string]any, ts time.Time) []domain.Event {
 		if name == "" {
 			name = "tool"
 		}
-		out = append(out, domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: name, RawType: "tool_call"})
+		out = append(out, domain.Event{Kind: domain.EventToolCall, Text: text, Timestamp: ts, ToolName: name, RawType: "tool_call", ToolArg: toolArg(text)})
 		if r := results[id]; r != "" {
 			out = append(out, domain.Event{Kind: domain.EventToolResult, Text: r, Timestamp: ts, RawType: "tool_result"})
 		}
@@ -648,11 +650,15 @@ func (p *vscodePlugin) scanSessionFile(path, ws string, entry map[string]any) (d
 	title := sessionTitle(root, entry, ev)
 	updated := sessionUpdatedAt(path, root, entry)
 	started := sessionStartedAt(root, entry, updated)
+	cwd := resolveSessionCWD(ws, root)
 	return domain.Session{
 		PluginID:  p.id,
 		AgentType: "copilot-vc",
 		SessionID: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
-		CWD:       resolveSessionCWD(ws, root),
+		CWD:       cwd,
+		// Copilot logs often carry no workspace path at all; let the host infer
+		// one from a temporally-near session (a cross-plugin heuristic).
+		InferCWD:  cwd == "(unknown)",
 		StartedAt: started,
 		UpdatedAt: updated,
 		Title:     title,
