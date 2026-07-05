@@ -191,7 +191,15 @@ func requestEvents(req map[string]any) []domain.Event {
 	if ut := requestUserText(req); ut != "" {
 		out = append(out, userEvent(ut, ts, "message"))
 	}
-	return append(out, responseEvents(req, ts)...)
+	out = append(out, responseEvents(req, ts)...)
+	// Stamp every event in this turn with the request's model so the host can
+	// show per-turn models even when the model changes between requests.
+	if m := requestModel(req); m != "" {
+		for i := range out {
+			out[i].Model = m
+		}
+	}
+	return out
 }
 
 // responseEvents walks the response parts in order, buffering markdown
@@ -404,16 +412,21 @@ func copilotDefaultTitle(s string) bool {
 	return copilotDefaultTitles[s] || copilotDefaultTitles[strings.ToLower(s)]
 }
 
-// copilotModel returns the model name of the last request, preferring
-// result.details and falling back to modelId.
+// requestModel returns one request's model name, preferring result.details and
+// falling back to modelId. Each request (turn) carries its own model.
+func requestModel(req map[string]any) string {
+	if d := strings.TrimSpace(common.String(common.Map(req["result"])["details"])); d != "" {
+		return d
+	}
+	return strings.TrimSpace(common.String(req["modelId"]))
+}
+
+// copilotModel returns the session-level model: the model of the last request
+// that names one. Per-turn models live on each event (see requestEvents).
 func copilotModel(root map[string]any) string {
 	reqs := common.Slice(root["requests"])
 	for i := len(reqs) - 1; i >= 0; i-- {
-		r := common.Map(reqs[i])
-		if d := strings.TrimSpace(common.String(common.Map(r["result"])["details"])); d != "" {
-			return d
-		}
-		if m := strings.TrimSpace(common.String(r["modelId"])); m != "" {
+		if m := requestModel(common.Map(reqs[i])); m != "" {
 			return m
 		}
 	}

@@ -431,6 +431,39 @@ func TestVSCopilotJSONLOpReplay(t *testing.T) {
 	}
 }
 
+// Each request's model is stamped onto its events (result.details preferred
+// over modelId), so the host can show per-turn models when the model changes
+// between requests. The session-level model stays the last request's model.
+func TestVSCopilotPerTurnModel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s1.json")
+	data := `{"version":3,"creationDate":1710000000000,"sessionId":"s1","requests":[
+  {"requestId":"r1","timestamp":1710000001000,"modelId":"copilot/gpt","message":{"text":"hello"},"response":[{"value":"ok"}],"result":{"details":"GPT-5"}},
+  {"requestId":"r2","timestamp":1710000002000,"modelId":"copilot/claude","message":{"text":"next"},"response":[{"value":"sure"}]}
+]}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ev, root := parseVSCodeSession(path)
+	if m := copilotModel(root); m != "copilot/claude" {
+		t.Fatalf("session model=%q, want copilot/claude (last request)", m)
+	}
+	want := map[string]string{"hello": "GPT-5", "ok": "GPT-5", "next": "copilot/claude", "sure": "copilot/claude"}
+	seen := map[string]bool{}
+	for _, e := range ev {
+		w, ok := want[e.Text]
+		if !ok {
+			continue
+		}
+		seen[e.Text] = true
+		if e.Model != w {
+			t.Fatalf("event %q model=%q, want %q", e.Text, e.Model, w)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("only saw %v of expected events %v", seen, want)
+	}
+}
+
 func TestVSCopilotEventTimestamps(t *testing.T) {
 	want := msToTime(float64(1710000001000))
 
