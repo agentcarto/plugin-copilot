@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/agentcarto/core/domain"
@@ -45,6 +46,74 @@ func TestParseJetBrainsCopilot(t *testing.T) {
 	}
 	if ev[2].Kind != domain.EventToolCall || ev[2].ToolName != "read_file" {
 		t.Fatalf("bad tool event: %#v", ev[2])
+	}
+}
+
+func TestParseJetBrainsCopilotRenderedAttachments(t *testing.T) {
+	dir := t.TempDir()
+	rendered := `<attachments>
+<attachment id="relative.go">
+Excerpt from relative.go, lines 1 to 2:
+` + "```go\npackage main\n```" + `
+</attachment>
+<attachment id="active.go" filePath="/repo/a&amp;b/active.go">
+User's active file for additional context:
+` + "```go\nfunc main() {}\n```" + `
+</attachment>
+</attachments>`
+	renderedJSON, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := `{"type":"partition.created","data":{"conversationId":"s1","partitionId":1,"source":"panel","createdAt":1710000000000},"timestamp":"2024-03-09T16:00:00Z"}
+{"type":"user.message","data":{"content":"review","turnId":"t1"},"timestamp":"2024-03-09T16:00:01Z"}
+{"type":"user.message_rendered","data":{"turnId":"t1","renderedMessage":` + string(renderedJSON) + `},"timestamp":"2024-03-09T16:00:01Z"}
+{"type":"assistant.message","data":{"content":"done","messageId":"m1"},"timestamp":"2024-03-09T16:00:02Z"}
+`
+	if err := os.WriteFile(filepath.Join(dir, "partition-1.jsonl"), []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := parseJetBrainsCopilot(context.Background(), dir)
+	if len(ev) != 4 {
+		t.Fatalf("events=%d %#v", len(ev), ev)
+	}
+	if ev[1].Kind != domain.EventAttachment || ev[1].ToolArg != "relative.go" || !strings.Contains(ev[1].Text, "package main") {
+		t.Fatalf("relative attachment=%#v", ev[1])
+	}
+	if ev[2].Kind != domain.EventAttachment || ev[2].ToolArg != "/repo/a&b/active.go" || !strings.Contains(ev[2].Text, "func main") {
+		t.Fatalf("active attachment=%#v", ev[2])
+	}
+	if ev[1].TurnID != "t1" || ev[2].TurnID != "t1" {
+		t.Fatalf("attachment turn ids=%q, %q", ev[1].TurnID, ev[2].TurnID)
+	}
+}
+
+func TestScanJetBrainsCopilotIgnoresInlineSessions(t *testing.T) {
+	root := t.TempDir()
+	sessionDir := filepath.Join(root, "inline-session")
+	if err := os.MkdirAll(sessionDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"type":"partition.created","data":{"conversationId":"inline-session","partitionId":1,"source":"inline","createdAt":1710000000000},"timestamp":"2024-03-09T16:00:00Z"}
+{"type":"user.message","data":{"content":"test","turnId":"t1"},"timestamp":"2024-03-09T16:00:01Z"}
+{"type":"assistant.message","data":{"content":"this must not be imported","messageId":"m1"},"timestamp":"2024-03-09T16:00:02Z"}
+{"type":"assistant.turn_end","data":{"turnId":"t1","status":"success","turnStatus":"success"},"timestamp":"2024-03-09T16:00:03Z"}
+`
+	if err := os.WriteFile(filepath.Join(sessionDir, "partition-1.jsonl"), []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := jetbrainsPlugin{id: "copilot", o: JetBrainsOptions{Dirs: []string{root}}}
+	res, err := p.Scan(context.Background(), plugin.ScanInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Sessions) != 0 {
+		t.Fatalf("inline sessions were imported: %#v", res.Sessions)
+	}
+	if ev := parseJetBrainsCopilot(context.Background(), sessionDir); len(ev) != 0 {
+		t.Fatalf("inline conversation events were loaded: %#v", ev)
 	}
 }
 
@@ -302,8 +371,8 @@ func TestScanJetBrainsCopilotBackfillsUnknownCWDFromNearbySession(t *testing.T) 
 	if err := os.MkdirAll(unknownDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	unknownData := `{"type":"user.message","data":{"content":"short inline prompt","turnId":"t2"},"timestamp":"2024-03-09T16:05:00Z"}
-{"type":"partition.created","data":{"conversationId":"unknown","partitionId":1,"source":"inline","createdAt":1710000300000},"timestamp":"2024-03-09T16:05:00Z"}
+	unknownData := `{"type":"user.message","data":{"content":"short panel prompt","turnId":"t2"},"timestamp":"2024-03-09T16:05:00Z"}
+{"type":"partition.created","data":{"conversationId":"unknown","partitionId":1,"source":"panel","createdAt":1710000300000},"timestamp":"2024-03-09T16:05:00Z"}
 {"type":"assistant.turn_end","data":{"turnId":"t2","status":"success"},"timestamp":"2024-03-09T16:05:10Z"}
 `
 	if err := os.WriteFile(filepath.Join(unknownDir, "partition-1.jsonl"), []byte(unknownData), 0600); err != nil {

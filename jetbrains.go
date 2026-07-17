@@ -3,8 +3,10 @@ package copilot
 import (
 	"context"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -30,7 +32,11 @@ func (JetBrainsFactory) Descriptor() plugin.Descriptor {
 	// (agent-specific pseudo-prompt vocabulary moved out of core).
 	// ParserVersion=4: tool calls carry ToolArg and unknown-CWD sessions are
 	// flagged InferCWD for the host's cross-plugin backfill.
-	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "4", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
+	// ParserVersion=5: inline sessions are excluded because JetBrains does not
+	// persist their assistant responses, leaving incomplete conversations.
+	// ParserVersion=6: files injected through user.message_rendered are surfaced
+	// as attachment events.
+	return plugin.Descriptor{Type: "copilot-jb", DisplayName: "GitHub Copilot Chat (JetBrains)", ParserVersion: "6", Capabilities: domain.Capabilities{Scan: true, Conversation: true}}
 }
 
 func (JetBrainsFactory) New(id string, n *yaml.Node) (any, error) {
@@ -213,6 +219,7 @@ func parseJetBrainsCopilotWithMeta(ctx context.Context, dir string) ([]domain.Ev
 	var events []domain.Event
 	var start time.Time
 	var paths []string
+	inline := false
 	for _, f := range files {
 		_ = common.JSONLines(ctx, f, func(_ int, o map[string]any) error {
 			ts := common.Time(common.String(o["timestamp"]))
@@ -221,6 +228,9 @@ func parseJetBrainsCopilotWithMeta(ctx context.Context, dir string) ([]domain.Ev
 			}
 			typ := common.String(o["type"])
 			data := common.Map(o["data"])
+			if typ == "partition.created" && strings.EqualFold(strings.TrimSpace(common.String(data["source"])), "inline") {
+				inline = true
+			}
 			paths = append(paths, jetBrainsPathCandidates(typ, data)...)
 			if typ == "partition.created" && start.IsZero() {
 				start = msToTime(data["createdAt"])
@@ -228,6 +238,9 @@ func parseJetBrainsCopilotWithMeta(ctx context.Context, dir string) ([]domain.Ev
 			events = append(events, jetBrainsRecordEvents(typ, data, ts)...)
 			return nil
 		})
+	}
+	if inline {
+		return nil, time.Time{}, ""
 	}
 	return events, start, inferCWDFromPathCandidates(paths)
 }
@@ -241,6 +254,8 @@ func jetBrainsRecordEvents(typ string, data map[string]any, ts time.Time) []doma
 		if text := strings.TrimSpace(common.String(data["content"])); text != "" {
 			return []domain.Event{userEvent(text, ts, "user.message")}
 		}
+	case "user.message_rendered":
+		return renderedAttachmentEvents(common.String(data["renderedMessage"]), common.String(data["turnId"]), ts)
 	case "assistant.message":
 		var out []domain.Event
 		if thinking := strings.TrimSpace(common.String(common.Map(data["thinking"])["text"])); thinking != "" {
@@ -267,6 +282,57 @@ func jetBrainsRecordEvents(typ string, data map[string]any, ts time.Time) []doma
 		return []domain.Event{{Kind: domain.EventTurnComplete, Timestamp: ts, RawType: "assistant.turn_end"}}
 	}
 	return nil
+}
+
+var (
+	attachmentStartRe  = regexp.MustCompile(`<attachment(?:\s+[^>]*)?>`)
+	attachmentIDAttrRe = regexp.MustCompile(`(?:^|\s)id="([^"]*)"`)
+)
+
+// renderedAttachmentEvents extracts the file context Copilot injected into a
+// rendered user message. The wrapper is XML-like rather than valid XML because
+// its body is unescaped source code, so scan only the attachment boundary tags.
+func renderedAttachmentEvents(rendered, turnID string, ts time.Time) []domain.Event {
+	var out []domain.Event
+	for offset := 0; offset < len(rendered); {
+		loc := attachmentStartRe.FindStringIndex(rendered[offset:])
+		if loc == nil {
+			break
+		}
+		tagStart := offset + loc[0]
+		bodyStart := offset + loc[1]
+		closeAt := strings.Index(rendered[bodyStart:], "</attachment>")
+		if closeAt < 0 {
+			break
+		}
+		closeStart := bodyStart + closeAt
+		tag := rendered[tagStart:bodyStart]
+		path := firstAttribute(filePathAttrRe, tag)
+		if path == "" {
+			path = firstAttribute(attachmentIDAttrRe, tag)
+		}
+		path = html.UnescapeString(path)
+		if path != "" {
+			out = append(out, domain.Event{
+				Kind:      domain.EventAttachment,
+				Text:      strings.TrimSpace(rendered[bodyStart:closeStart]),
+				Timestamp: ts,
+				ToolArg:   path,
+				RawType:   "user.message_rendered.attachment",
+				TurnID:    turnID,
+			})
+		}
+		offset = closeStart + len("</attachment>")
+	}
+	return out
+}
+
+func firstAttribute(re *regexp.Regexp, tag string) string {
+	m := re.FindStringSubmatch(tag)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
 }
 
 // jetBrainsPathCandidates extracts path-like strings from a record, used to
